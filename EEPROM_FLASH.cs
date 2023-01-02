@@ -1,6 +1,19 @@
 // EEPROM_FLASH.cs - EEPROM and Flash emulation aimed at larger scoped
 // emulators of older hardware such as NES or SMS.
 //
+// Supports the following:
+//   EEPROM  - Device variations described by size; page size
+//             Functionality variations including
+//               - expected command sequence differences
+//               - write buffer overflow behaviour differences
+//
+//   FLASH   - Microchip SST39SF010A   128k, 4k page size
+//             Microchip SST39SF020A   256k, 4k page size
+//             Microchip SST39SF040    512k, 4k page size
+//             Macronix  MX29F040      512k, 64k page size
+//             AMD       AM29F040      512k, 64k page size
+//             AMIC      A29040B       512k, 64k page size
+//
 // This is free and unencumbered software released into the public domain.
 // 
 // Anyone is free to copy, modify, publish, use, compile, sell, or
@@ -24,6 +37,7 @@
 
 //-----------------------------------------------------------------------------------------------------------
 // History
+// - v1.01 - 01/01/23 - Added support for flash chips MX29F040, AM29F040, and A29040B
 // - v1.00 - 12/20/22 - Initial release by Scott Williams
 
 //-----------------------------------------------------------------------------------------------------------
@@ -37,6 +51,7 @@
 //-----------------------------------------------------------------------------------------------------------
 // Todo
 // - Multiple EEPROMs controlled by a single I2C interface
+// - Validation/Unit tests
 
 using System.Runtime.CompilerServices;
 
@@ -198,17 +213,26 @@ public unsafe struct EEPROM_I2C
 // FLASH
 //-----------------------------------------------------------------------------------------------------------
 // https://ww1.microchip.com/downloads/en/DeviceDoc/20005022C.pdf
+// https://pdf1.alldatasheet.com/datasheet-pdf/view/74482/MCNIX/MX29F040.html
+// https://pdf1.alldatasheet.com/datasheet-pdf/view/55458/AMD/AM29F040.html
+// https://pdf1.alldatasheet.com/datasheet-pdf/view/118471/AMICC/A29040B.html
 
 public unsafe struct FLASH_SST39SF0xx
 {
-    public enum DeviceType
+    // 63 - 36   total size
+    // 35 - 16   sector size
+    // 15 - 08   manufacturer id
+    // 07 - 00   device id
+    public enum DeviceType : ulong
     {
         Unknown = 0,
-        SST39SF010A = 0xb5,
-        SST39SF020A = 0xb6,
-        SST39SF040 = 0xb7,
+        SST39SF010A = 0x0020000_01000_bf_b5u,  // 128k, 4k
+        SST39SF020A = 0x0040000_01000_bf_b6u,  // 256k, 4k
+        SST39SF040 = 0x0080000_01000_bf_b7u,   // 512k, 4k
+        MX29F040 = 0x0080000_10000_c2_a4u,     // 512k, 64k
+        AM29F040 = 0x0080000_10000_01_a4u,     // 512k, 64k
+        A29040B = 0x0080000_10000_37_86u,      // 512k, 64k
     }
-    const int idManufacturer = 0xbf;
     DeviceType idDevice;
 
     fixed ushort kNextCommandAddr[5];
@@ -218,7 +242,7 @@ public unsafe struct FLASH_SST39SF0xx
     int busCycle;
     int softwareIdMode;
 
-    const int kSectorSize = 4096;
+    int sectorSize;
     int addressMax;
     byte* mem;
     int dataWritten;  // to support potential auto-save
@@ -235,11 +259,15 @@ public unsafe struct FLASH_SST39SF0xx
         busCycle = 0;
         softwareIdMode = 0;
 
+        sectorSize = (int)((ulong)type >> 16) & 0xf_ffff;
+        addressMax = ((int)((ulong)type >> 36) & 0xfff_ffff) - 1;
         switch (type)
         {
-            case DeviceType.SST39SF010A: addressMax = kSectorSize * 32 - 1; break;
-            case DeviceType.SST39SF020A: addressMax = kSectorSize * 64 - 1; break;
-            case DeviceType.SST39SF040: addressMax = kSectorSize * 128 - 1; break;
+            case DeviceType.MX29F040:
+            case DeviceType.A29040B:
+                for (int i = 0; i < 5; i++)
+                    kNextCommandAddr[i] >>= 4;
+                break;
         }
         mem = flashMem;
         dataWritten = 0;
@@ -252,7 +280,7 @@ public unsafe struct FLASH_SST39SF0xx
             busCycle++;
         else if (softwareIdMode != 0 && busCycle == 0 && data == 0xf0)
             softwareIdMode = 0;
-        else if (busCycle == 2 && address == 0x5555)
+        else if (busCycle == 2 && kNextCommandAddr[2] == address)
         {
             busCycle = 0;
             if (softwareIdMode != 0)
@@ -267,8 +295,8 @@ public unsafe struct FLASH_SST39SF0xx
             busCycle = 0;  // by this point, both valid and invalid commands will next reset the mode
             if (data == 0x30)
             {
-                byte* p = mem + (address & ~kSectorSize & addressMax);
-                for (byte* pEnd = p + kSectorSize; p < pEnd; p++)
+                byte* p = mem + (address & ~sectorSize & addressMax);
+                for (byte* pEnd = p + sectorSize; p < pEnd; p++)
                     *p = 0xff;
             }
             else if (address == 0x5555 && data == 0x10)
@@ -291,7 +319,7 @@ public unsafe struct FLASH_SST39SF0xx
         if (softwareIdMode == 0)  // most common case
             return mem[address & addressMax];
         if (address == 0)
-            return idManufacturer;
+            return (byte)((int)idDevice >> 8);
         else if (address == 1)
             return (byte)idDevice;
         return 0xff;  // @@ Not sure what you get back from other addresses during softwareIdMode
